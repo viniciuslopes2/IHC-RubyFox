@@ -1,0 +1,36 @@
+{
+  "generate_sql.predict": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Generate SQL from natural language.\n\nDatabase schema:\n  - estoque: id, produto, departamento, data_fabricacao, data_validade, quantidade, preco\n\nTask Description & Specific Instructions for the Assistant:\n\nThe task is to translate natural language questions about the `estoque` database into corresponding SQL queries. The assistant should prioritize generating accurate and efficient SQL code that directly answers the user's question based on the provided schema.  Crucially, the generated SQL *must* use appropriate filtering and aggregation techniques to address different types of questions (e.g., retrieval, comparison, sorting).\n\nKey Considerations & Domain-Specific Knowledge:\n\n1. **Data Types:** Always recognize data types when generating SQL. Specifically:\n    - `INTEGER`: For numeric quantities like `quantidade`.\n    - `VARCHAR(50)`:  For text fields like `produto` and `departamento`. Ensure string literals are properly enclosed in single quotes (e.g., 'sabonete').\n    - `DATE`: For dates, use the appropriate date format that SQL understands (YYYY-MM-DD is generally reliable).\n\n2. **Query Construction Strategy:** The assistant should primarily use the following strategy:\n   a. **Identify Key Columns & Table:**  Determine which columns from the `estoque` table are relevant to answering the question.\n   b. **Construct WHERE Clause:** Use the `WHERE` clause with appropriate comparison operators (e.g., `=`, `>`, `<`, `LIKE`) based on the natural language query.\n   c. **Apply Aggregation/Sorting:**  If the question requires summarizing or ordering data, use functions like `ORDER BY`, `LIMIT`, and aggregate functions like `COUNT()`, `SUM()`, `AVG()`.\n   d. **Select Appropriate Columns:** After filtering and aggregation, select only the columns necessary to provide a complete answer.\n\n3. **Specific Question Types & SQL Patterns:**\n    - **Retrieval of Specific Values:**  (e.g., \"qual o departamento do sabonete?\") – Use `SELECT` with `=` for equality comparisons.\n    - **Finding Maximum/Minimum Value:** (e.g., \"qual produto tem a maior quantidade em estoque?\") - Use `ORDER BY quantidade DESC LIMIT 1;` to retrieve the product with the highest quantity.  It’s important to return *only* the product name in this case, not all columns.\n    - **General Queries:** Handle queries that require more complex filtering or aggregation using appropriate combinations of `WHERE`, `ORDER BY`, and aggregate functions.\n\n4. **Error Handling (Implicit):** If the assistant cannot directly answer a question based on the schema, it should return an empty SQL query and a reasoning explaining why a direct answer isn’t possible. This signals that the question requires additional information or a different approach.\n\nExample Output Format: (Consistent with previous examples)\n\n### reasoning\n[Detailed explanation of how the SQL query addresses the natural language question.]\n\n### sql_query\n[The generated SQL query as text.]",
+      "fields": [
+        {
+          "prefix": "Dbschema:",
+          "description": "Database schema"
+        },
+        {
+          "prefix": "Question:",
+          "description": "Natural language question"
+        },
+        {
+          "prefix": "Reasoning:",
+          "description": "${reasoning}"
+        },
+        {
+          "prefix": "Sql Query:",
+          "description": "Valid SQL query"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.14",
+      "dspy": "3.3.0",
+      "cloudpickle": "3.1"
+    }
+  }
+}
