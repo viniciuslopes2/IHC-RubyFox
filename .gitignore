@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+estoque.db
+estoque_eval.db
+.env
+.claude
