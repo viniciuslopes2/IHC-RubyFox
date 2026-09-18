@@ -1,10 +1,10 @@
 {
-  "generate_sql.predict": {
+  "generate_sql": {
     "traces": [],
     "train": [],
     "demos": [],
     "signature": {
-      "instructions": "Generate SQL from natural language.\n\nDatabase schema:\n  - estoque: id, produto, departamento, data_fabricacao, data_validade, quantidade, preco\n\nTask Description & Specific Instructions for the Assistant:\n\nThe task is to translate natural language questions about the `estoque` database into corresponding SQL queries. The assistant should prioritize generating accurate and efficient SQL code that directly answers the user's question based on the provided schema.  Crucially, the generated SQL *must* use appropriate filtering and aggregation techniques to address different types of questions (e.g., retrieval, comparison, sorting).\n\nKey Considerations & Domain-Specific Knowledge:\n\n1. **Data Types:** Always recognize data types when generating SQL. Specifically:\n    - `INTEGER`: For numeric quantities like `quantidade`.\n    - `VARCHAR(50)`:  For text fields like `produto` and `departamento`. Ensure string literals are properly enclosed in single quotes (e.g., 'sabonete').\n    - `DATE`: For dates, use the appropriate date format that SQL understands (YYYY-MM-DD is generally reliable).\n\n2. **Query Construction Strategy:** The assistant should primarily use the following strategy:\n   a. **Identify Key Columns & Table:**  Determine which columns from the `estoque` table are relevant to answering the question.\n   b. **Construct WHERE Clause:** Use the `WHERE` clause with appropriate comparison operators (e.g., `=`, `>`, `<`, `LIKE`) based on the natural language query.\n   c. **Apply Aggregation/Sorting:**  If the question requires summarizing or ordering data, use functions like `ORDER BY`, `LIMIT`, and aggregate functions like `COUNT()`, `SUM()`, `AVG()`.\n   d. **Select Appropriate Columns:** After filtering and aggregation, select only the columns necessary to provide a complete answer.\n\n3. **Specific Question Types & SQL Patterns:**\n    - **Retrieval of Specific Values:**  (e.g., \"qual o departamento do sabonete?\") – Use `SELECT` with `=` for equality comparisons.\n    - **Finding Maximum/Minimum Value:** (e.g., \"qual produto tem a maior quantidade em estoque?\") - Use `ORDER BY quantidade DESC LIMIT 1;` to retrieve the product with the highest quantity.  It’s important to return *only* the product name in this case, not all columns.\n    - **General Queries:** Handle queries that require more complex filtering or aggregation using appropriate combinations of `WHERE`, `ORDER BY`, and aggregate functions.\n\n4. **Error Handling (Implicit):** If the assistant cannot directly answer a question based on the schema, it should return an empty SQL query and a reasoning explaining why a direct answer isn’t possible. This signals that the question requires additional information or a different approach.\n\nExample Output Format: (Consistent with previous examples)\n\n### reasoning\n[Detailed explanation of how the SQL query addresses the natural language question.]\n\n### sql_query\n[The generated SQL query as text.]",
+      "instructions": "Generate a valid SQLite SELECT query from a natural language question,\ngiven the database schema.\n\n    Database schema:\n      - estoque: id, produto, departamento, data_fabricacao, data_validade, quantidade, preco\n\nColumn selection rule: default to `SELECT *` for any question about which\nproduct(s) match a condition, even when the condition itself filters,\norders, or ranks by a specific column. Filtering/sorting/ranking BY a\ncolumn (preco, data_validade, quantidade) is NOT the same as asking FOR\nthat column's value:\n  - \"quais produtos sao de bebidas\" -> SELECT *\n  - \"quais produtos custam mais de 5 reais\" -> SELECT * (filters by preco,\n    does not ask for preco)\n  - \"qual o produto mais caro\" / \"mais barato\" -> SELECT * (ranks by\n    preco, does not ask for preco)\n  - \"qual produto vence primeiro\" / \"vencem antes de X\" -> SELECT * (ranks\n    or filters by data_validade, does not ask for the date)\n  - \"existe produto X\" -> SELECT * WHERE produto = 'X' (exact match with\n    `=`, never LIKE, unless the question explicitly asks for similar or\n    partial names)\nOnly select specific columns when the question explicitly asks to see\nthat one attribute's value itself (e.g. \"qual o preco de X\" -> preco,\n\"quantas unidades de X\" -> quantidade).\n\n`previous_sql` and `previous_error` are empty on the first attempt. When they\nare filled, it means a previous attempt failed validation/execution: analyze\n`previous_error` and produce a corrected `sql_query` that fixes the problem,\ninstead of repeating the same mistake.",
       "fields": [
         {
           "prefix": "Dbschema:",
@@ -15,8 +15,12 @@
           "description": "Natural language question"
         },
         {
-          "prefix": "Reasoning:",
-          "description": "${reasoning}"
+          "prefix": "Previous Sql:",
+          "description": "Previous failed SQL attempt, empty on the first try"
+        },
+        {
+          "prefix": "Previous Error:",
+          "description": "Error raised by the previous attempt, empty on the first try"
         },
         {
           "prefix": "Sql Query:",
