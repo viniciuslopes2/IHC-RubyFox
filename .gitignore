@@ -4,4 +4,4 @@ __pycache__/
 estoque.db
 estoque_eval.db
 .env
-.claude
+.claude/
