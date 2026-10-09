@@ -1,0 +1,189 @@
+ANOTACOES - BOT DE ESTOQUE (TELEGRAM + IA + GEPA)
+====================================================
+
+VISAO GERAL
+-----------
+O projeto e um chatbot de Telegram que responde perguntas em portugues sobre
+um estoque (ex: "qual o preco do sabonete?"), por texto ou audio.
+
+Fluxo:
+1. Usuario manda uma pergunta (texto ou voz) no Telegram.
+2. Se for voz, o Whisper transcreve para texto.
+3. Uma IA (LLM) transforma a pergunta em uma consulta SQL.
+4. Um validador checa se o SQL e seguro (so permite SELECT, bloqueia
+   qualquer coisa que apague ou altere dados: INSERT, UPDATE, DELETE,
+   DROP, ALTER, etc).
+5. O SQL validado e enviado para uma API (main.py), que roda num banco
+   SQLite e devolve o resultado.
+6. O bot formata o resultado e responde no Telegram.
+
+Resumo em uma frase: o usuario faz uma pergunta em portugues, a IA converte
+em SQL com seguranca, e o bot responde com o dado do estoque.
+
+
+ARQUIVOS DO PROJETO
+--------------------
+
+main.py -> a API do banco de dados
+  - Monta um servidor FastAPI com uma rota GET /query?sql=...
+  - Cria e popula (reseta) a tabela "estoque" com 5 produtos fixos
+    (sabonete, agua, coca, shampoo, suco de laranja) toda vez que inicia.
+  - Executa o SQL recebido e devolve o resultado em JSON.
+  - Observacao: essa API nao tem validacao propria; toda a seguranca
+    (bloquear DROP/DELETE etc) e feita do lado do bot, antes de mandar
+    a query pra ca.
+
+bot.py -> o cerebro do bot (onde esta a maior parte da logica)
+  - SQLValidator: so permite SELECT, bloqueia palavras perigosas, e
+    testa o SQL contra um banco SQLite em memoria antes de rodar de
+    verdade.
+  - TextToSQL (dspy.Signature): define como o LLM deve gerar o SQL a
+    partir da pergunta e do schema do banco.
+  - RLMSQLGenerator / RLMTask: o agente de IA (ver secao RLM abaixo).
+  - EstoqueTelegramBot: registra os handlers do Telegram (/start, texto,
+    voz) e usa o Whisper para transcrever audio.
+  - run_query_api: faz a chamada HTTP pra API do main.py.
+  - InvalidSQLError: erro unico levantado quando o SQL e invalido ou
+    nao e um SELECT.
+  - format_results: formata a resposta (remove coluna "id", formata
+    preco como "R$ X,XX").
+  - Parte de avaliacao e otimizacao (GEPA) - ver secao GEPA abaixo.
+
+  Comandos de linha de comando:
+    python bot.py          -> inicia o bot de verdade
+    python bot.py eval      -> roda avaliacao e imprime relatorio de acuracia
+    python bot.py optimize  -> roda a otimizacao GEPA
+
+optimized_generator.json
+  - E o resultado salvo da otimizacao GEPA: os prompts/instrucoes do
+    agente depois de melhorados automaticamente. O bot carrega esse
+    arquivo se ele existir, usando a versao ja otimizada.
+
+estoque.db / estoque_eval.db
+  - Bancos SQLite (producao e avaliacao). Sao recriados do zero (DROP +
+    CREATE + seed) toda vez que a aplicacao roda.
+
+
+RLM (Recursive Language Model) - classes RLMTask e RLMSQLGenerator
+--------------------------------------------------------------------
+E a parte do agente que usa o padrao ReAct (raciocinio + uso de
+ferramentas em loop) em vez de responder a pergunta de uma vez so.
+
+Ferramentas que o agente pode chamar:
+  - draft_sql: pede um rascunho de SQL ao LLM.
+  - check_sql: valida esse rascunho com o SQLValidator.
+  - recurse: se a pergunta do usuario na verdade e DUAS perguntas
+    disfarcadas de uma (ex: "qual o preco do sabonete e quantas
+    unidades de agua tem?"), o agente chama a si mesmo de novo para
+    resolver cada parte separadamente. Tem um limite de profundidade
+    (max_recursion_depth = 2) para nao entrar em loop infinito.
+
+Loop logico: gera SQL -> valida -> se invalido, tenta de novo passando
+o erro anterior -> repete até acertar ou esgotar tentativas (max_iters).
+
+
+GEPA - otimizacao automatica do prompt
+-----------------------------------------
+Ideia geral: em vez de o humano escrever o prompt perfeito manualmente,
+um "professor" (outro LLM, chamado reflection_lm) le os erros do agente
+num dataset de teste e reescreve automaticamente as instrucoes do
+agente para melhorar a precisao.
+
+Pecas do codigo (bot.py):
+
+1) EVALUATION_DATASET
+   18 pares de pergunta + SQL "gabarito" (resposta correta), usados
+   como material de teste.
+
+2) normalize_rows(rows)
+   Ordena e transforma o resultado da query em tuplas, para poder
+   comparar resultados mesmo que o SQL escrito seja diferente (dois
+   SQLs diferentes podem gerar o mesmo resultado).
+
+3) evaluate()
+   Roda o agente contra o dataset, compara resultado gerado vs
+   esperado, e imprime um relatorio de acuracia (comando "eval"). Isso
+   e so a "nota", ainda nao e o GEPA.
+
+4) make_gepa_metric(repository) -> metric(gold, pred, ...)
+   A funcao de avaliacao usada PELO GEPA. Para cada tentativa do
+   agente, devolve uma nota (score) e um FEEDBACK EM TEXTO explicando
+   o erro (o que saiu, o que devia ter saido, qual seria o SQL certo).
+   Esse feedback em linguagem natural e o que alimenta o "professor".
+
+5) Conversao para dspy.Example (dentro de optimize())
+   Converte o dataset Python para o formato dspy.Example, marcando
+   "question" como entrada e "expected_sql" como gabarito de comparacao
+   (nao entra no prompt).
+
+6) optimize()
+   Monta e executa a otimizacao de fato.
+
+
+LINHAS MAIS IMPORTANTES DO GEPA (com numero da linha em bot.py)
+-------------------------------------------------------------------
+
+Linha 413:
+  split = max(1, int(len(dataset) * 0.7))
+  -> Calcula o ponto de corte: 70% do dataset vai pra treino.
+  Como funciona: multiplica o tamanho da lista por 0.7, converte pra
+  inteiro (arredonda pra baixo), e usa max(1, ...) pra nunca dar 0.
+
+Linha 414:
+  trainset, valset = dataset[:split], dataset[split:] or dataset[:split]
+  -> Separa as perguntas em treino (achar erros) e validacao (confirmar
+  melhora).
+  Como funciona: usa slicing de lista (tudo antes do indice "split" /
+  tudo depois). O "or dataset[:split]" e um fallback: se a validacao
+  ficar vazia, usa o proprio treino como validacao tambem.
+
+Linha 416:
+  reflection_lm = dspy.LM(REFLECTION_LM_MODEL, ...)
+  -> Cria o LLM "professor", que vai ler os erros e reescrever o prompt.
+  Como funciona: so instancia um objeto que sabe como chamar aquele
+  modelo (ainda nao executa nada).
+
+Linha 417:  *** uma das 3 mais importantes ***
+  optimizer = dspy.GEPA(metric=make_gepa_metric(repository), auto="light", reflection_lm=reflection_lm)
+  -> Monta o otimizador, amarrando a metrica (o que e "erro") com o
+  professor (quem corrige) e o nivel de esforco (auto="light").
+  Sem essa linha nao existe GEPA.
+
+Linha 420:  *** uma das 3 mais importantes ***
+  optimized = optimizer.compile(RLMSQLGenerator(), trainset=trainset, valset=valset)
+  -> E ONDE O PROCESSO RODA DE FATO: testa o agente no trainset, pega
+  os erros, manda pro reflection_lm corrigir o prompt, confirma a
+  melhora no valset, e repete. Devolve uma nova versao melhorada
+  (optimized).
+
+Linha 421:
+  optimized.save(OPTIMIZED_PATH)
+  -> Salva o prompt melhorado em optimized_generator.json (serializa o
+  estado em JSON e escreve no arquivo).
+
+Linha 373:
+  expected_rows = normalize_rows(repository.run_query(gold.expected_sql))
+  -> Roda o SQL gabarito no banco pra saber qual e o resultado correto.
+
+Linhas 390-391:
+  if generated_rows == expected_rows:
+      return dspy.Prediction(score=1.0, feedback="SQL correto: mesmo resultado do gabarito.")
+  -> Compara as duas listas de tuplas; se forem iguais, nota maxima (1.0).
+
+Linhas 393-400:  *** uma das 3 mais importantes ***
+  return dspy.Prediction(score=0.0, feedback=f"...Um SQL correto seria: '{gold.expected_sql}'...")
+  -> Quando erra, devolve nota 0 e um texto (f-string) explicando o
+  erro. Esse e o "combustivel" que o reflection_lm usa pra saber o que
+  corrigir no prompt - sem isso o GEPA seria so uma avaliacao comum,
+  sem capacidade de se auto-corrigir.
+
+
+AS 3 LINHAS MAIS IMPORTANTES DE TODAS (nucleo do GEPA)
+---------------------------------------------------------
+1. Linha 417 - cria o otimizador (amarra metrica + professor)
+2. Linha 420 - executa o ciclo de teste/correcao/repeticao
+3. Linhas 393-400 - gera o feedback em texto que alimenta a correcao
+
+As demais linhas (split de dados, criar o reflection_lm, salvar o
+resultado) sao importantes mas sao apenas preparacao ou consequencia
+dessas 3.

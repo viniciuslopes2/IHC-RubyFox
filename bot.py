@@ -4,19 +4,35 @@ import sqlite3
 import sys
 import tempfile
 import threading
-from dataclasses import dataclass
 
 import dspy
 import requests
 import telebot
 import whisper
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OPTIMIZED_PATH = os.path.join(BASE_DIR, "optimized_generator.json")
+EVAL_DB = "estoque_eval.db"
+
+API_URL = "http://127.0.0.1:8000/query"
+LM_MODEL = "openai/gemma-3-4b-instruct"
+LM_API_BASE = "http://localhost:1234/v1"
+LM_API_KEY = "not-needed"
+# O "professor" do GEPA pode ser outro modelo, via variavel de ambiente
+REFLECTION_LM_MODEL = os.environ.get("GEPA_REFLECTION_LM", LM_MODEL)
+REFLECTION_LM_API_BASE = os.environ.get("GEPA_REFLECTION_LM_API_BASE", LM_API_BASE)
+REFLECTION_LM_API_KEY = os.environ.get("GEPA_REFLECTION_LM_API_KEY", LM_API_KEY)
+
+MAX_ITERS = 6
+MAX_RECURSION_DEPTH = 2
+
 FORBIDDEN_KEYWORDS = (
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
     "CREATE", "REPLACE", "TRUNCATE", "ATTACH", "PRAGMA",
 )
 
-SCHEMA_DDL = """
+# Mesmo schema do main.py, usado para testar o SQL num banco em memoria
+SCHEMA = """
 CREATE TABLE estoque (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     produto TEXT NOT NULL,
@@ -28,82 +44,16 @@ CREATE TABLE estoque (
 )
 """
 
-SCHEMA_DESCRIPTION = """
-CREATE TABLE estoque (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  produto VARCHAR(50),
-  departamento VARCHAR(50),
-  data_fabricacao DATE,
-  data_validade DATE,
-  quantidade INTEGER,
-  preco REAL
-);
-"""
-
-
-@dataclass(frozen=True)
-class BotConfig:
-    base_dir: str = os.path.dirname(os.path.abspath(__file__))
-    optimized_program_filename: str = "optimized_generator.json"
-    eval_db_filename: str = "estoque_eval.db"
-    api_url: str = "http://127.0.0.1:8000/query"
-    lm_model: str = "openai/gemma-3-4b-instruct"
-    lm_api_base: str = "http://localhost:1234/v1"
-    lm_api_key: str = "not-needed"
-    whisper_model_name: str = "base"
-    max_generation_attempts: int = 3
-    max_recursion_depth: int = 2
-
-    @property
-    def optimized_program_path(self) -> str:
-        return os.path.join(self.base_dir, self.optimized_program_filename)
-
-    @property
-    def eval_db_path(self) -> str:
-        return os.path.join(self.base_dir, self.eval_db_filename)
-
-    @property
-    def reflection_lm_model(self) -> str:
-        return os.environ.get("GEPA_REFLECTION_LM", self.lm_model)
-
-    @property
-    def reflection_lm_api_base(self) -> str:
-        return os.environ.get("GEPA_REFLECTION_LM_API_BASE", self.lm_api_base)
-
-    @property
-    def reflection_lm_api_key(self) -> str:
-        return os.environ.get("GEPA_REFLECTION_LM_API_KEY", self.lm_api_key)
-
-    @property
-    def telegram_token(self) -> str:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        if not token:
-            raise RuntimeError("Defina a variavel de ambiente TELEGRAM_BOT_TOKEN antes de iniciar o bot.")
-        return token
-
-
-class SQLValidationError(Exception):
-    def __init__(self, sql_query, original_error):
-        self.sql_query = sql_query
-        self.original_error = original_error
-        super().__init__(f"Query invalida: {original_error}")
-
-
-class SelectOnlyError(Exception):
-    def __init__(self, sql_query, keyword):
-        self.sql_query = sql_query
-        self.keyword = keyword
-        super().__init__(f"Apenas SELECT e permitido, encontrado: {keyword}")
-
-
 CODE_FENCE_RE = re.compile(r"^```(?:sql)?\s*\n?(.*?)\n?```$", re.IGNORECASE | re.DOTALL)
 
 
-class SQLValidator:
-    def __init__(self, schema_ddl: str = SCHEMA_DDL, forbidden_keywords=FORBIDDEN_KEYWORDS):
-        self._schema_ddl = schema_ddl
-        self._forbidden_keywords = forbidden_keywords
+class InvalidSQLError(Exception):
+    def __init__(self, sql_query, reason):
+        self.sql_query = sql_query
+        super().__init__(f"Query invalida: {reason}")
 
+
+class SQLValidator:
     @staticmethod
     def strip_code_fence(sql_query: str) -> str:
         match = CODE_FENCE_RE.match(sql_query.strip())
@@ -112,25 +62,26 @@ class SQLValidator:
     def check_select_only(self, sql_query: str) -> None:
         statements = [s.strip() for s in sql_query.split(";") if s.strip()]
         if len(statements) != 1:
-            raise SelectOnlyError(sql_query, "multiplas instrucoes")
+            raise InvalidSQLError(sql_query, "multiplas instrucoes")
 
         statement = statements[0]
         if not statement.upper().startswith("SELECT"):
-            raise SelectOnlyError(sql_query, statement.split()[0].upper())
+            raise InvalidSQLError(sql_query, f"apenas SELECT e permitido, encontrado {statement.split()[0].upper()}")
 
-        for keyword in self._forbidden_keywords:
+        for keyword in FORBIDDEN_KEYWORDS:
             if re.search(rf"\b{keyword}\b", statement, re.IGNORECASE):
-                raise SelectOnlyError(sql_query, keyword)
+                raise InvalidSQLError(sql_query, f"apenas SELECT e permitido, encontrado {keyword}")
 
     def validate(self, sql_query: str) -> None:
         self.check_select_only(sql_query)
 
+        # Executa num banco vazio so para pegar erros de sintaxe, tabela ou coluna
         conn = sqlite3.connect(":memory:")
         try:
-            conn.execute(self._schema_ddl)
+            conn.execute(SCHEMA)
             conn.execute(sql_query)
         except sqlite3.Error as error:
-            raise SQLValidationError(sql_query, error) from error
+            raise InvalidSQLError(sql_query, error) from error
         finally:
             conn.close()
 
@@ -197,16 +148,9 @@ _recursion_depth = threading.local()
 
 
 class RLMSQLGenerator(dspy.Module):
-    def __init__(
-        self,
-        validator: SQLValidator,
-        schema: str = SCHEMA_DESCRIPTION,
-        max_iters: int = 6,
-        max_depth: int = 2,
-    ):
+    def __init__(self, max_iters: int = MAX_ITERS, max_depth: int = MAX_RECURSION_DEPTH):
         super().__init__()
-        self.schema = schema
-        self.validator = validator
+        self.validator = SQLValidator()
         self.max_depth = max_depth
         self.generate_sql = dspy.Predict(TextToSQL)
         self.agent = dspy.ReAct(RLMTask, tools=[self.draft_sql, self.check_sql, self.recurse], max_iters=max_iters)
@@ -215,7 +159,7 @@ class RLMSQLGenerator(dspy.Module):
         """Gera um candidato de SQL para a pergunta. Numa nova tentativa, passe o
         SQL e o erro anteriores em previous_sql/previous_error para corrigi-lo."""
         pred = self.generate_sql(
-            dbschema=self.schema,
+            dbschema=SCHEMA,
             question=question,
             previous_sql=previous_sql,
             previous_error=previous_error,
@@ -227,7 +171,7 @@ class RLMSQLGenerator(dspy.Module):
         try:
             self.validator.validate(sql_query)
             return "valido"
-        except (SQLValidationError, SelectOnlyError) as error:
+        except InvalidSQLError as error:
             return f"invalido: {error}"
 
     def recurse(self, sub_question: str) -> str:
@@ -240,48 +184,46 @@ class RLMSQLGenerator(dspy.Module):
 
     def forward(self, question, _depth=0):
         _recursion_depth.value = _depth
-        pred = self.agent(dbschema=self.schema, question=question)
+        pred = self.agent(dbschema=SCHEMA, question=question)
 
+        # Checagem final, mesmo que o agente diga que ja validou
         sql_query = self.validator.strip_code_fence(pred.sql_query)
         self.validator.validate(sql_query)
         return dspy.Prediction(sql_query=sql_query)
 
 
-class SQLGeneratorService:
-    def __init__(self, generator: RecursiveSQLGenerator, optimized_program_path: str | None = None):
-        self._generator = generator
-        if optimized_program_path and os.path.exists(optimized_program_path):
-            try:
-                self._generator.load(optimized_program_path)
-            except Exception as error:
-                print(
-                    f"Aviso: nao foi possivel carregar o programa otimizado em "
-                    f"'{optimized_program_path}' ({error}). Usando o modulo sem otimizacao.",
-                    file=sys.stderr,
-                )
+def configure_lm() -> None:
+    lm = dspy.LM(LM_MODEL, api_base=LM_API_BASE, api_key=LM_API_KEY)
+    dspy.configure(lm=lm, adapter=dspy.ChatAdapter())
 
-    def generate(self, question: str) -> str:
+
+def build_generator() -> RLMSQLGenerator:
+    configure_lm()
+    generator = RLMSQLGenerator()
+    if os.path.exists(OPTIMIZED_PATH):
         try:
-            prediction = self._generator(question=question)
-        except (SQLValidationError, SelectOnlyError):
-            raise
+            generator.load(OPTIMIZED_PATH)
         except Exception as error:
-            raise SQLValidationError(None, error) from error
-
-        return prediction.sql_query
-
-
-class EstoqueAPIClient:
-    def __init__(self, api_url: str):
-        self._api_url = api_url
-
-    def run_query(self, sql_query: str) -> list[dict]:
-        response = requests.get(self._api_url, params={"sql": sql_query}, timeout=10)
-        response.raise_for_status()
-        return response.json()["results"]
+            print(f"Aviso: nao foi possivel carregar o programa otimizado ({error}).", file=sys.stderr)
+    return generator
 
 
-def _format_value(key: str, value) -> str:
+def generate_sql(generator: RLMSQLGenerator, question: str) -> str:
+    try:
+        return generator(question=question).sql_query
+    except InvalidSQLError:
+        raise
+    except Exception as error:
+        raise InvalidSQLError(None, error) from error
+
+
+def run_query_api(sql_query: str) -> list[dict]:
+    response = requests.get(API_URL, params={"sql": sql_query}, timeout=10)
+    response.raise_for_status()
+    return response.json()["results"]
+
+
+def format_value(key: str, value) -> str:
     if key == "preco" and isinstance(value, (int, float)):
         return f"R$ {value:.2f}"
     return str(value)
@@ -294,97 +236,72 @@ def format_results(results: list[dict]) -> str:
     lines = []
     for row in results:
         fields = {k: v for k, v in row.items() if k != "id"}
-        if len(fields) == 1:
-            (key, value), = fields.items()
-            lines.append(_format_value(key, value))
-        else:
-            lines.append(", ".join(_format_value(k, v) for k, v in fields.items()))
-
+        lines.append(", ".join(format_value(k, v) for k, v in fields.items()))
     return "\n".join(lines)
 
 
 class EstoqueTelegramBot:
-    def __init__(self, config: BotConfig, sql_service: SQLGeneratorService, api_client: EstoqueAPIClient):
-        self._config = config
-        self._sql_service = sql_service
-        self._api_client = api_client
-        self._bot = telebot.TeleBot(config.telegram_token)
-        self._whisper_model = whisper.load_model(config.whisper_model_name)
-        self._register_handlers()
+    def __init__(self, generator: RLMSQLGenerator):
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not token:
+            raise RuntimeError("Defina a variavel de ambiente TELEGRAM_BOT_TOKEN antes de iniciar o bot.")
 
-    def _register_handlers(self) -> None:
-        self._bot.message_handler(commands=["start"])(self._handle_start)
-        self._bot.message_handler(content_types=["text"])(self._handle_text)
-        self._bot.message_handler(content_types=["voice"])(self._handle_voice)
+        self.generator = generator
+        self.bot = telebot.TeleBot(token)
+        self.whisper_model = whisper.load_model("base")
 
-    def _handle_start(self, message) -> None:
-        self._bot.reply_to(message, "Pergunte algo sobre o estoque, por texto ou audio.")
+        self.bot.message_handler(commands=["start"])(self.handle_start)
+        self.bot.message_handler(content_types=["text"])(self.handle_text)
+        self.bot.message_handler(content_types=["voice"])(self.handle_voice)
 
-    def _handle_text(self, message) -> None:
-        self._answer_question(message, message.text)
+    def handle_start(self, message) -> None:
+        self.bot.reply_to(message, "Pergunte algo sobre o estoque, por texto ou audio.")
 
-    def _handle_voice(self, message) -> None:
-        file_info = self._bot.get_file(message.voice.file_id)
-        audio_bytes = self._bot.download_file(file_info.file_path)
+    def handle_text(self, message) -> None:
+        self.answer(message, message.text)
+
+    def handle_voice(self, message) -> None:
+        file_info = self.bot.get_file(message.voice.file_id)
+        audio_bytes = self.bot.download_file(file_info.file_path)
 
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
             tmp_file.write(audio_bytes)
             tmp_path = tmp_file.name
 
         try:
-            transcription = self._whisper_model.transcribe(tmp_path, language="portuguese")
-            question = transcription["text"].strip()
+            question = self.whisper_model.transcribe(tmp_path, language="portuguese")["text"].strip()
         except Exception as error:
-            self._bot.reply_to(message, f"Nao consegui transcrever o audio: {error}")
+            self.bot.reply_to(message, f"Nao consegui transcrever o audio: {error}")
             return
         finally:
             os.remove(tmp_path)
 
-        self._answer_question(message, question)
+        self.answer(message, question)
 
-    def _answer_question(self, message, question: str) -> None:
+    def answer(self, message, question: str) -> None:
         try:
-            sql_query = self._sql_service.generate(question)
-        except (SQLValidationError, SelectOnlyError) as error:
-            self._bot.reply_to(message, f"Nao consegui gerar uma consulta valida: {error}")
+            sql_query = generate_sql(self.generator, question)
+        except InvalidSQLError as error:
+            self.bot.reply_to(message, f"Nao consegui gerar uma consulta valida: {error}")
             return
 
         print(f"[SQL] {question!r} -> {sql_query!r}", file=sys.stderr)
 
         try:
-            results = self._api_client.run_query(sql_query)
+            results = run_query_api(sql_query)
         except requests.RequestException as error:
-            self._bot.reply_to(message, f"Erro ao consultar a API: {error}")
+            self.bot.reply_to(message, f"Erro ao consultar a API: {error}")
             return
 
-        self._bot.reply_to(message, format_results(results))
+        self.bot.reply_to(message, format_results(results))
 
     def run(self) -> None:
-        self._bot.infinity_polling()
+        self.bot.infinity_polling()
 
 
-def configure_lm(config: BotConfig) -> None:
-    lm = dspy.LM(config.lm_model, api_base=config.lm_api_base, api_key=config.lm_api_key)
-    dspy.configure(lm=lm, adapter=dspy.ChatAdapter())
-
-
-def build_sql_service(config: BotConfig) -> SQLGeneratorService:
-    configure_lm(config)
-    validator = SQLValidator()
-    generator = RLMSQLGenerator(
-        validator,
-        max_iters=config.max_generation_attempts * 2,
-        max_depth=config.max_recursion_depth,
-    )
-    return SQLGeneratorService(generator, config.optimized_program_path)
-
-
-def build_bot(config: BotConfig | None = None) -> EstoqueTelegramBot:
-    config = config or BotConfig()
-    sql_service = build_sql_service(config)
-    api_client = EstoqueAPIClient(config.api_url)
-    return EstoqueTelegramBot(config, sql_service, api_client)
-
+# ---------------------------------------------------------------------------
+# Avaliacao e otimizacao (GEPA)
+# ---------------------------------------------------------------------------
 
 EVALUATION_DATASET = [
     {"question": "Liste todos os produtos do estoque", "expected_sql": "SELECT * FROM estoque"},
@@ -408,83 +325,59 @@ EVALUATION_DATASET = [
 ]
 
 
-@dataclass
-class EvaluationResult:
-    question: str
-    expected_sql: str
-    generated_sql: str | None
-    error: str | None
-    passed: bool
-
-
-def _normalize_rows(rows: list[dict]) -> list[tuple]:
+def normalize_rows(rows: list[dict]) -> list[tuple]:
+    # Ordena para comparar resultados independente da ordem das linhas
     return sorted(tuple(row.values()) for row in rows)
 
 
-def evaluate(config: BotConfig | None = None, dataset: list[dict] = EVALUATION_DATASET) -> list[EvaluationResult]:
-    from main import EstoqueConfig, EstoqueRepository
+def create_eval_repository():
+    from main import EstoqueRepository
 
-    config = config or BotConfig()
-    sql_service = build_sql_service(config)
-
-    repository = EstoqueRepository(EstoqueConfig(base_dir=config.base_dir, db_filename=config.eval_db_filename))
+    repository = EstoqueRepository(EVAL_DB)
     repository.create_and_seed()
+    return repository
 
-    results = []
-    for item in dataset:
+
+def evaluate() -> None:
+    generator = build_generator()
+    repository = create_eval_repository()
+
+    passed = 0
+    for item in EVALUATION_DATASET:
         question, expected_sql = item["question"], item["expected_sql"]
-        expected_rows = _normalize_rows(repository.run_query(expected_sql))
+        expected_rows = normalize_rows(repository.run_query(expected_sql))
 
-        generated_sql = None
-        error = None
-        passed = False
+        generated_sql, error, ok = None, None, False
         try:
-            generated_sql = sql_service.generate(question)
-            generated_rows = _normalize_rows(repository.run_query(generated_sql))
-            passed = generated_rows == expected_rows
-        except (SQLValidationError, SelectOnlyError) as err:
-            generated_sql = err.sql_query
-            error = str(err)
+            generated_sql = generate_sql(generator, question)
+            ok = normalize_rows(repository.run_query(generated_sql)) == expected_rows
+        except InvalidSQLError as err:
+            generated_sql, error = err.sql_query, str(err)
 
-        results.append(EvaluationResult(question, expected_sql, generated_sql, error, passed))
-
-    return results
-
-
-def print_evaluation_report(results: list[EvaluationResult]) -> None:
-    total = len(results)
-    passed = sum(1 for r in results if r.passed)
-
-    for r in results:
-        status = "OK" if r.passed else "FALHOU"
-        print(f"[{status}] {r.question}")
-        print(f"  esperado : {r.expected_sql.strip()}")
-        print(f"  gerado   : {r.generated_sql}")
-        if r.error:
-            print(f"  erro     : {r.error}")
+        passed += ok
+        print(f"[{'OK' if ok else 'FALHOU'}] {question}")
+        print(f"  esperado : {expected_sql}")
+        print(f"  gerado   : {generated_sql}")
+        if error:
+            print(f"  erro     : {error}")
         print()
 
-    accuracy = passed / total if total else 0.0
-    print(f"Acuracia de execucao: {passed}/{total} ({accuracy:.1%})")
+    total = len(EVALUATION_DATASET)
+    print(f"Acuracia de execucao: {passed}/{total} ({passed / total:.1%})")
 
 
-def _to_gepa_examples(dataset: list[dict] = EVALUATION_DATASET) -> list["dspy.Example"]:
-    return [
-        dspy.Example(question=item["question"], expected_sql=item["expected_sql"]).with_inputs("question")
-        for item in dataset
-    ]
-
-
-def _make_gepa_metric(repository):
+def make_gepa_metric(repository):
+    # Alem da nota, devolve um texto explicando o erro. Esse feedback e o que o
+    # GEPA usa para reescrever as instrucoes do agente.
     def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
-        expected_rows = _normalize_rows(repository.run_query(gold.expected_sql))
+        expected_rows = normalize_rows(repository.run_query(gold.expected_sql))
         sql_query = getattr(pred, "sql_query", None)
 
         if not sql_query:
             return dspy.Prediction(score=0.0, feedback="Nenhum SQL foi gerado para a pergunta.")
 
         try:
-            generated_rows = _normalize_rows(repository.run_query(sql_query))
+            generated_rows = normalize_rows(repository.run_query(sql_query))
         except Exception as error:
             return dspy.Prediction(
                 score=0.0,
@@ -509,41 +402,31 @@ def _make_gepa_metric(repository):
     return metric
 
 
-def run_gepa_optimization(config: BotConfig | None = None) -> None:
-    config = config or BotConfig()
-    configure_lm(config)
+def optimize() -> None:
+    configure_lm()
+    repository = create_eval_repository()
 
-    from main import EstoqueConfig, EstoqueRepository
-
-    repository = EstoqueRepository(EstoqueConfig(base_dir=config.base_dir, db_filename=config.eval_db_filename))
-    repository.create_and_seed()
-
-    dataset = _to_gepa_examples()
+    dataset = [
+        dspy.Example(question=item["question"], expected_sql=item["expected_sql"]).with_inputs("question")
+        for item in EVALUATION_DATASET
+    ]
     split = max(1, int(len(dataset) * 0.7))
     trainset, valset = dataset[:split], dataset[split:] or dataset[:split]
 
-    student = RLMSQLGenerator(
-        SQLValidator(),
-        max_iters=config.max_generation_attempts * 2,
-        max_depth=config.max_recursion_depth,
-    )
-    reflection_lm = dspy.LM(
-        config.reflection_lm_model,
-        api_base=config.reflection_lm_api_base,
-        api_key=config.reflection_lm_api_key,
-    )
-    optimizer = dspy.GEPA(metric=_make_gepa_metric(repository), auto="light", reflection_lm=reflection_lm)
+    reflection_lm = dspy.LM(REFLECTION_LM_MODEL, api_base=REFLECTION_LM_API_BASE, api_key=REFLECTION_LM_API_KEY)
+    optimizer = dspy.GEPA(metric=make_gepa_metric(repository), auto="light", reflection_lm=reflection_lm)
 
     print(f"Rodando GEPA: {len(trainset)} treino / {len(valset)} validacao...")
-    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
-    optimized.save(config.optimized_program_path)
-    print(f"Programa otimizado salvo em: {config.optimized_program_path}")
+    optimized = optimizer.compile(RLMSQLGenerator(), trainset=trainset, valset=valset)
+    optimized.save(OPTIMIZED_PATH)
+    print(f"Programa otimizado salvo em: {OPTIMIZED_PATH}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "eval":
-        print_evaluation_report(evaluate())
-    elif len(sys.argv) > 1 and sys.argv[1] == "optimize":
-        run_gepa_optimization()
+    command = sys.argv[1] if len(sys.argv) > 1 else "bot"
+    if command == "eval":
+        evaluate()
+    elif command == "optimize":
+        optimize()
     else:
-        build_bot().run()
+        EstoqueTelegramBot(build_generator()).run()

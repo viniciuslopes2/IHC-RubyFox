@@ -1,21 +1,9 @@
 import os
 import sqlite3
-from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException
 
-
-@dataclass(frozen=True)
-class EstoqueConfig:
-    """Configuracao de acesso ao banco de estoque."""
-
-    base_dir: str = os.path.dirname(os.path.abspath(__file__))
-    db_filename: str = "estoque.db"
-
-    @property
-    def db_path(self) -> str:
-        return os.path.join(self.base_dir, self.db_filename)
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SCHEMA = """
 CREATE TABLE estoque (
@@ -39,61 +27,47 @@ SEED_DATA = [
 
 
 class EstoqueRepository:
-    """Encapsula todo o acesso ao SQLite do estoque (conexao, schema, queries)."""
+    """Cuida de todo o acesso ao SQLite do estoque."""
 
-    def __init__(self, config: EstoqueConfig):
-        self._config = config
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._config.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def __init__(self, db_filename: str = "estoque.db"):
+        self.db_path = os.path.join(BASE_DIR, db_filename)
 
     def create_and_seed(self) -> None:
-        conn = self._connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS estoque")
-            cursor.execute(SCHEMA)
-            cursor.executemany(
+        # Recria a tabela do zero a cada execucao
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS estoque")
+            conn.execute(SCHEMA)
+            conn.executemany(
                 "INSERT INTO estoque "
                 "(produto, departamento, data_fabricacao, data_validade, quantidade, preco) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 SEED_DATA,
             )
-            conn.commit()
-        finally:
-            conn.close()
 
     def run_query(self, sql_query: str) -> list[dict]:
-        conn = self._connect()
+        conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(sql_query)
-            columns = [description[0] for description in cursor.description]
+            columns = [d[0] for d in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
         finally:
             conn.close()
 
 
-def create_app(config: EstoqueConfig | None = None) -> FastAPI:
-    config = config or EstoqueConfig()
-    repository = EstoqueRepository(config)
-    repository.create_and_seed()
+repository = EstoqueRepository()
+repository.create_and_seed()
 
-    app = FastAPI(title="Estoque API")
-
-    @app.get("/query")
-    def query(sql: str):
-        try:
-            results = repository.run_query(sql)
-        except Exception as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-        return {"results": results}
-
-    return app
+app = FastAPI(title="Estoque API")
 
 
-app = create_app()
+@app.get("/query")
+def query(sql: str):
+    # A validacao (apenas SELECT) e feita no gerador, do lado do bot
+    try:
+        return {"results": repository.run_query(sql)}
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
 
 if __name__ == "__main__":
     import uvicorn
