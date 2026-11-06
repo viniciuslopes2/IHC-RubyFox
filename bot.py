@@ -23,6 +23,9 @@ REFLECTION_LM_MODEL = os.environ.get("GEPA_REFLECTION_LM", LM_MODEL)
 REFLECTION_LM_API_BASE = os.environ.get("GEPA_REFLECTION_LM_API_BASE", LM_API_BASE)
 REFLECTION_LM_API_KEY = os.environ.get("GEPA_REFLECTION_LM_API_KEY", LM_API_KEY)
 
+# USAR_AGENTE=1 forca o agente ReAct completo em toda pergunta (mais lento)
+FORCE_AGENT = os.environ.get("USAR_AGENTE") == "1"
+
 MAX_ITERS = 6
 MAX_RECURSION_DEPTH = 2
 
@@ -182,6 +185,12 @@ class RLMSQLGenerator(dspy.Module):
             return "profundidade maxima de recursao atingida, resolva sem recursar mais"
         return self(sub_question, _depth=depth + 1).sql_query
 
+    def quick(self, question: str) -> str:
+        """Caminho rapido: 1 unica chamada a IA + validacao, sem o loop do agente."""
+        sql_query = self.draft_sql(question)
+        self.validator.validate(sql_query)
+        return sql_query
+
     def forward(self, question, _depth=0):
         _recursion_depth.value = _depth
         pred = self.agent(dbschema=SCHEMA, question=question)
@@ -194,7 +203,8 @@ class RLMSQLGenerator(dspy.Module):
 
 def configure_lm() -> None:
     lm = dspy.LM(LM_MODEL, api_base=LM_API_BASE, api_key=LM_API_KEY)
-    dspy.configure(lm=lm, adapter=dspy.ChatAdapter())
+    # Sem fallback para JSONAdapter: o LM Studio recusa response_format=json_object
+    dspy.configure(lm=lm, adapter=dspy.ChatAdapter(use_json_adapter_fallback=False))
 
 
 def build_generator() -> RLMSQLGenerator:
@@ -208,7 +218,14 @@ def build_generator() -> RLMSQLGenerator:
     return generator
 
 
-def generate_sql(generator: RLMSQLGenerator, question: str) -> str:
+def generate_sql(generator: RLMSQLGenerator, question: str, use_agent: bool = False) -> str:
+    # Por padrao tenta o caminho rapido (1 chamada a IA) e so aciona o agente
+    # ReAct completo se o SQL nao passar na validacao. use_agent=True pula o atalho.
+    if not use_agent and not FORCE_AGENT:
+        try:
+            return generator.quick(question)
+        except Exception as error:
+            print(f"[quick falhou, usando agente] {error}", file=sys.stderr)
     try:
         return generator(question=question).sql_query
     except InvalidSQLError:
@@ -349,8 +366,8 @@ def evaluate() -> None:
 
         generated_sql, error, ok = None, None, False
         try:
-            generated_sql = generate_sql(generator, question)
-            ok = normalize_rows(repository.run_query(generated_sql)) == expected_rows
+            generated_sql = generate_sql(generator, question, use_agent=True)
+            ok =normalize_rows(repository.run_query(generated_sql)) == expected_rows
         except InvalidSQLError as err:
             generated_sql, error = err.sql_query, str(err)
 
